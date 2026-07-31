@@ -3,6 +3,7 @@ import re
 import io
 import csv
 import json
+import sqlite3
 import datetime as dt
 from dataclasses import dataclass, field
 import streamlit as st
@@ -68,10 +69,27 @@ DURATION_RULES = [
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
 # Approximate published Google Maps Distance Matrix pricing: ~$5 per 1000
-# elements (1 element = 1 origin/destination pair). This is a rough estimate
-# of what this run *would* cost outside any free monthly credit — not an
-# official billing figure.
+# elements (1 element = 1 origin/destination pair). Rough estimate only —
+# not an official billing figure.
 DISTANCE_MATRIX_COST_PER_1000 = 5.0
+
+# How long a cached drive time is considered good before we'll ask Google
+# Maps for a fresh one again. Traffic patterns repeat roughly by time of
+# day, so a few hours is a reasonable balance between accuracy and not
+# re-paying for the same route over and over in one workday.
+DRIVE_TIME_CACHE_MAX_AGE_HOURS = 6
+
+# How many past searches to keep in history before old ones are cleaned up.
+MAX_SAVED_RUNS = 100
+
+# SQLite file sits next to this script. NOTE: if this app is deployed on a
+# host with an ephemeral filesystem (e.g. it gets rebuilt/redeployed from
+# scratch periodically), this file — and the history/cache in it — can get
+# wiped on redeploy. It persists fine across normal day-to-day usage and
+# restarts in between. For guaranteed permanence, this would need to move
+# to an external database instead.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, "schedule_history.db")
 
 # ============================================================================
 
@@ -102,7 +120,6 @@ class SlotRecommendation:
     drive_before_min: float
     drive_after_min: float
     detour_min: float
-    area_confidence: str = "zip"   # "zip" | "city" | "office" (office/zip = strong, city = weak)
     notes: list = field(default_factory=list)
 
 @dataclass
@@ -117,13 +134,104 @@ class ScheduleConflict:
 
 def clean_display(text: str, max_len: int = 100) -> str:
     """Collapse messy whitespace/line breaks from raw calendar notes and
-    trim to a readable length for on-screen display. Safe to pass to
-    st.text()/st.code() (never st.markdown, to avoid Streamlit interpreting
-    $ signs or stray */_ characters in real notes as formatting)."""
+    trim to a readable length. Only ever pass this to st.text()/st.code()
+    (never st.markdown) — raw notes can contain $ signs or stray */_
+    characters that Streamlit's markdown renderer would try to interpret
+    as formatting."""
     text = " ".join((text or "").split())
     if len(text) > max_len:
         text = text[:max_len].rstrip() + "…"
     return text
+
+
+# ============================= PERSISTENT STORAGE ============================
+
+@st.cache_resource
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            calendar_label TEXT NOT NULL,
+            api_call_count INTEGER,
+            data_json TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS drive_time_cache (
+            origin TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            minutes REAL NOT NULL,
+            cached_at TEXT NOT NULL,
+            PRIMARY KEY (origin, destination)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def save_run(conn, mode: str, calendar_label: str, data: dict) -> int:
+    now = dt.datetime.now().isoformat()
+    cur = conn.execute(
+        "INSERT INTO runs (created_at, mode, calendar_label, api_call_count, data_json) VALUES (?, ?, ?, ?, ?)",
+        (now, mode, calendar_label, data.get("api_call_count", 0), json.dumps(data)),
+    )
+    conn.commit()
+    conn.execute(
+        "DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT ?)",
+        (MAX_SAVED_RUNS,),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_runs(conn, limit: int = 25):
+    cur = conn.execute(
+        "SELECT id, created_at, mode, calendar_label FROM runs ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    return cur.fetchall()
+
+
+def load_run(conn, run_id: int) -> dict | None:
+    cur = conn.execute("SELECT data_json FROM runs WHERE id = ?", (run_id,))
+    row = cur.fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def delete_run(conn, run_id: int):
+    conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+    conn.commit()
+
+
+def get_cached_drive_time(conn, origin: str, destination: str, max_age_hours: float) -> float | None:
+    cur = conn.execute(
+        "SELECT minutes, cached_at FROM drive_time_cache WHERE origin = ? AND destination = ?",
+        (origin, destination),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    minutes, cached_at = row
+    cached_dt = dt.datetime.fromisoformat(cached_at)
+    if dt.datetime.now() - cached_dt > dt.timedelta(hours=max_age_hours):
+        return None
+    return minutes
+
+
+def save_drive_time_to_cache(conn, origin: str, destination: str, minutes: float):
+    now = dt.datetime.now().isoformat()
+    conn.execute(
+        """INSERT INTO drive_time_cache (origin, destination, minutes, cached_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(origin, destination) DO UPDATE SET minutes = excluded.minutes, cached_at = excluded.cached_at""",
+        (origin, destination, minutes, now),
+    )
+    conn.commit()
+
+# ============================================================================
 
 
 def get_calendar_service():
@@ -170,7 +278,7 @@ def get_calendar_service():
                 try:
                     flow.fetch_token(code=code)
                     creds = flow.credentials
-                except Exception as e:
+                except Exception:
                     st.error(
                         "That code didn't work. If this keeps happening, contact "
                         "whoever set up this app — the sign-in link may need to be "
@@ -273,14 +381,10 @@ def get_unscheduled_patients(service) -> tuple[list[Patient], list[str], list[st
             combined_text = f"{summary} {description}"
             combined_lower = combined_text.lower()
 
-            # Automatically skip patients explicitly marked not schedulable
-            # (e.g. outside our service area) instead of trying to route them.
             if any(marker in combined_lower for marker in DO_NOT_SCHEDULE_MARKERS):
                 skipped_do_not_schedule.append(summary or "(untitled event)")
                 continue
 
-            # Track (rather than silently drop) patients with no address on
-            # file, so nobody just disappears without anyone noticing.
             if not location:
                 skipped_no_address.append(summary or "(untitled event)")
                 continue
@@ -301,17 +405,13 @@ def get_unscheduled_patients(service) -> tuple[list[Patient], list[str], list[st
     return patients, skipped_no_address, skipped_do_not_schedule
 
 
-# Cache of already-fetched calendar schedules for this run, keyed by
-# (calendar_id, start_date, end_date) — avoids re-fetching the same
-# calendar's events once per patient when batching multiple patients.
+# In-memory cache (this run only) of already-fetched calendar schedules,
+# keyed by (calendar_id, start_date, end_date) — avoids re-fetching the
+# same calendar's events once per patient when batching multiple patients.
 _schedule_cache: dict[tuple[str, dt.date, dt.date], tuple[dict[dt.date, list[Stop]], list[ScheduleConflict]]] = {}
 
 
 def get_days_schedule(service, calendar_id: str, start_date: dt.date, end_date: dt.date) -> tuple[dict[dt.date, list[Stop]], list[ScheduleConflict]]:
-    """Returns (schedule, conflicts). Conflicts are pairs of events already
-    on the calendar that overlap each other — flagged instead of silently
-    treated as normal, since overlapping data makes recommendations
-    unreliable around those times."""
     cache_key = (calendar_id, start_date, end_date)
     if cache_key in _schedule_cache:
         return _schedule_cache[cache_key]
@@ -334,7 +434,7 @@ def get_days_schedule(service, calendar_id: str, start_date: dt.date, end_date: 
             ).execute()
         except Exception:
             st.error(
-                f"Couldn't read the existing schedule for one of the calendars. "
+                "Couldn't read the existing schedule for one of the calendars. "
                 "Recommendations for that calendar may be treating busy days "
                 "as open — double-check before booking anything from this run."
             )
@@ -377,11 +477,18 @@ def get_days_schedule(service, calendar_id: str, start_date: dt.date, end_date: 
 
 
 class DriveTimeEstimator:
-    def __init__(self, api_key: str, status_box):
+    """Checks an in-memory cache first, then the persistent SQLite cache
+    (shared across runs/sessions), and only calls the Google Maps API if
+    neither has a recent-enough answer. Real API results get written back
+    to the persistent cache so future searches can reuse them."""
+
+    def __init__(self, api_key: str, status_box, conn):
         self.client = googlemaps.Client(key=api_key) if (api_key and googlemaps) else None
         self.cache: dict[tuple[str, str], float] = {}
         self.api_call_count = 0
+        self.cache_hit_count = 0
         self.status_box = status_box
+        self.conn = conn
 
     def minutes_between(self, origin: str, destination: str, depart_at: dt.datetime) -> float:
         if origin == destination:
@@ -389,6 +496,12 @@ class DriveTimeEstimator:
         key = (origin, destination)
         if key in self.cache:
             return self.cache[key]
+
+        cached = get_cached_drive_time(self.conn, origin, destination, DRIVE_TIME_CACHE_MAX_AGE_HOURS)
+        if cached is not None:
+            self.cache[key] = cached
+            self.cache_hit_count += 1
+            return cached
 
         minutes = None
         if self.client:
@@ -410,15 +523,15 @@ class DriveTimeEstimator:
 
         if minutes is None:
             minutes = 25.0
+        else:
+            # only persist real API results, not the flat 25-min fallback guess
+            save_drive_time_to_cache(self.conn, origin, destination, minutes)
 
         self.cache[key] = minutes
         return minutes
 
 
 def area_match(loc1: str, loc2: str) -> tuple[bool, str]:
-    """Returns (matched, confidence). confidence is 'zip' (strong,
-    matching 5-digit zip) or 'city' (weaker, matched only on a city-name
-    substring) or 'none' if no match found."""
     t1 = loc1.lower()
     t2 = loc2.lower()
     z1 = set(re.findall(r'\b85\d{3}\b', t1))
@@ -436,10 +549,6 @@ def area_match(loc1: str, loc2: str) -> tuple[bool, str]:
         if c in t1 and c in t2:
             return True, "city"
     return False, "none"
-
-
-# Strength ordering for combining two confidence readings (weakest wins)
-_CONFIDENCE_RANK = {"office": 3, "zip": 2, "city": 1, "none": 0}
 
 
 def find_slots_for_patient_on_calendar(
@@ -481,21 +590,14 @@ def find_slots_for_patient_on_calendar(
             if gap_start < day_start: gap_start = day_start
             if gap_end <= gap_start: continue
 
-            if prev_stop.location == OFFICE_ADDRESS:
-                prev_conf = "office"
-            else:
-                matched, prev_conf = area_match(prev_stop.location, patient.location)
+            if prev_stop.location != OFFICE_ADDRESS:
+                matched, _ = area_match(prev_stop.location, patient.location)
                 if not matched:
                     continue
-
-            if next_stop.location == OFFICE_ADDRESS:
-                next_conf = "office"
-            else:
-                matched, next_conf = area_match(next_stop.location, patient.location)
+            if next_stop.location != OFFICE_ADDRESS:
+                matched, _ = area_match(next_stop.location, patient.location)
                 if not matched:
                     continue
-
-            overall_confidence = min(prev_conf, next_conf, key=lambda c: _CONFIDENCE_RANK[c])
 
             drive_to = estimator.minutes_between(prev_stop.location, patient.location, gap_start)
             earliest_arrival = gap_start + dt.timedelta(minutes=drive_to)
@@ -515,7 +617,7 @@ def find_slots_for_patient_on_calendar(
                 candidates.append(SlotRecommendation(
                     patient=patient, calendar_name=calendar_name, day=day, start=earliest_arrival, end=appt_end,
                     drive_before_min=drive_to, drive_after_min=drive_from, detour_min=max(detour, 0),
-                    area_confidence=overall_confidence, notes=notes,
+                    notes=notes,
                 ))
 
                 if len(candidates) >= max_slots:
@@ -526,9 +628,47 @@ def find_slots_for_patient_on_calendar(
     return candidates
 
 
-def recs_to_csv(all_recs_list: list[tuple[str, SlotRecommendation]]) -> str:
-    """Plain CSV export of every recommendation, for printing or working
-    from outside the app."""
+# ============================= DICT CONVERSION ================================
+# Recommendations/conflicts get converted to plain dicts (with ISO date/time
+# strings) right after they're computed, so the exact same rendering code
+# and CSV export can work whether the data just came from a fresh run or
+# was loaded back out of the history database.
+
+def rec_to_dict(cal_name: str, rec: SlotRecommendation) -> dict:
+    return {
+        "cal_name": cal_name,
+        "patient_name": rec.patient.name,
+        "day": rec.day.isoformat(),
+        "start": rec.start.isoformat(),
+        "end": rec.end.isoformat(),
+        "drive_before": rec.drive_before_min,
+        "drive_after": rec.drive_after_min,
+        "detour": rec.detour_min,
+        "notes": rec.notes,
+    }
+
+
+def conflict_to_dict(cal_name: str, c: ScheduleConflict) -> dict:
+    return {
+        "cal_name": cal_name,
+        "day": c.day.isoformat(),
+        "event1_summary": c.event1_summary,
+        "event1_start": c.event1_start.isoformat(),
+        "event1_end": c.event1_end.isoformat(),
+        "event2_summary": c.event2_summary,
+        "event2_start": c.event2_start.isoformat(),
+    }
+
+
+def fmt_dict_time(iso_str: str) -> str:
+    return dt.datetime.fromisoformat(iso_str).strftime("%I:%M %p").lstrip("0")
+
+
+def fmt_dict_day(iso_str: str, fmt: str = "%A, %B %d") -> str:
+    return dt.date.fromisoformat(iso_str).strftime(fmt)
+
+
+def recs_to_csv(recommendations: list[dict]) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([
@@ -536,25 +676,135 @@ def recs_to_csv(all_recs_list: list[tuple[str, SlotRecommendation]]) -> str:
         "Drive There (min)", "Drive To Next Stop (min)", "Extra Drive Time Added (min)",
         "Notes",
     ])
-    for cal_name, rec in all_recs_list:
+    for r in recommendations:
         writer.writerow([
-            clean_display(rec.patient.name, max_len=200),
-            cal_name,
-            rec.day.strftime("%A, %b %d, %Y"),
-            rec.start.strftime("%I:%M %p").lstrip("0"),
-            rec.end.strftime("%I:%M %p").lstrip("0"),
-            f"{rec.drive_before_min:.0f}",
-            f"{rec.drive_after_min:.0f}",
-            f"{rec.detour_min:.0f}",
-            " / ".join(rec.notes),
+            clean_display(r["patient_name"], max_len=200),
+            r["cal_name"],
+            fmt_dict_day(r["day"], "%A, %b %d, %Y"),
+            fmt_dict_time(r["start"]),
+            fmt_dict_time(r["end"]),
+            f"{r['drive_before']:.0f}",
+            f"{r['drive_after']:.0f}",
+            f"{r['detour']:.0f}",
+            " / ".join(r["notes"]),
         ])
     return buf.getvalue()
+
+
+def render_results(data: dict):
+    """Renders a full results view from a plain dict — used for both a
+    freshly-completed run and a run reloaded from history."""
+
+    conflicts = data.get("conflicts", [])
+    if conflicts:
+        with st.expander(f"⚠️ Heads up: {len(conflicts)} double-booked time slot(s) found on the calendar", expanded=True):
+            st.caption("These are two appointments already scheduled at the same time. "
+                       "Suggestions near these times might not be reliable until this is fixed.")
+            for c in conflicts:
+                st.markdown(f"**{c['cal_name']} — {fmt_dict_day(c['day'])}**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.caption(f"Starts {fmt_dict_time(c['event1_start'])}")
+                    st.text(clean_display(c["event1_summary"], 90))
+                with col2:
+                    st.caption(f"Overlaps — starts {fmt_dict_time(c['event2_start'])}")
+                    st.text(clean_display(c["event2_summary"], 90))
+                st.divider()
+
+    skipped_dns = data.get("skipped_dns", [])
+    skipped_no_address = data.get("skipped_no_address", [])
+    if skipped_dns or skipped_no_address:
+        with st.expander(f"ℹ️ {len(skipped_dns) + len(skipped_no_address)} patient(s) not included in this search", expanded=False):
+            if skipped_dns:
+                st.markdown("**Marked \"do not schedule\" (e.g. outside our service area):**")
+                for name in skipped_dns:
+                    st.text(clean_display(name, 90))
+            if skipped_no_address:
+                st.markdown("**No address on file — can't calculate driving directions for them:**")
+                for name in skipped_no_address:
+                    st.text(clean_display(name, 90))
+
+    st.markdown("---")
+    st.subheader("📋 Suggested Appointment Times")
+
+    api_calls = data.get("api_call_count", 0)
+    cache_hits = data.get("cache_hit_count", 0)
+    estimated_cost = (api_calls / 1000) * DISTANCE_MATRIX_COST_PER_1000
+    cache_note = f" (plus {cache_hits} reused from previous searches, no charge)" if cache_hits else ""
+    st.caption(f"Checked {api_calls} new driving routes this search{cache_note} "
+               f"— roughly ${estimated_cost:.2f} in Google Maps usage, before any free monthly credit.")
+
+    recommendations = data.get("recommendations", [])
+    if not recommendations:
+        st.warning("No open time slots were found. Try a wider date range, or check the notes above for excluded patients.")
+        return
+
+    sorted_recs = sorted(recommendations, key=lambda r: r["start"])
+    best = sorted_recs[0]
+
+    with st.container(border=True):
+        st.markdown("### ⭐ Best Option")
+        st.markdown(f"**Patient:** {clean_display(best['patient_name'], 80)}")
+        st.markdown(f"**Employee:** {best['cal_name']}")
+        st.markdown(f"**When:** {fmt_dict_day(best['day'])}, {fmt_dict_time(best['start'])} – {fmt_dict_time(best['end'])}")
+        st.caption(f"Adds about {best['detour']:.0f} extra minutes of driving to that day "
+                   f"({best['drive_before']:.0f} min drive there, {best['drive_after']:.0f} min to the next stop)")
+        for note in best["notes"]:
+            st.warning(note, icon="⚠️")
+
+    # Compare employees, when more than one calendar contributed results
+    by_patient: dict[str, dict[str, dict]] = {}
+    for r in recommendations:
+        slot = by_patient.setdefault(r["patient_name"], {})
+        if r["cal_name"] not in slot or r["detour"] < slot[r["cal_name"]]["detour"]:
+            slot[r["cal_name"]] = r
+
+    multi_tech_patients = {n: c for n, c in by_patient.items() if len(c) > 1}
+    if multi_tech_patients:
+        st.markdown("### 👥 Which Employee Should Take This?")
+        for pname, cal_recs in multi_tech_patients.items():
+            ranked = sorted(cal_recs.items(), key=lambda kv: kv[1]["detour"])
+            best_tech, best_tech_rec = ranked[0]
+            with st.container(border=True):
+                st.markdown(f"**{clean_display(pname, 80)}**")
+                st.markdown(f"Better fit: **{best_tech}** — "
+                            f"{fmt_dict_day(best_tech_rec['day'], '%a, %b %d')} at "
+                            f"{fmt_dict_time(best_tech_rec['start'])} "
+                            f"(+{best_tech_rec['detour']:.0f} min extra driving)")
+                for cal_name, rec in ranked[1:]:
+                    st.caption(f"{cal_name} could also do {fmt_dict_day(rec['day'], '%a, %b %d')} at "
+                               f"{fmt_dict_time(rec['start'])} (+{rec['detour']:.0f} min extra driving)")
+
+    if len(sorted_recs) > 1:
+        st.markdown("### Other Times That Would Work")
+        for rec in sorted_recs[1:]:
+            with st.container(border=True):
+                st.markdown(f"**{clean_display(rec['patient_name'], 80)}** — {rec['cal_name']}")
+                st.markdown(f"{fmt_dict_day(rec['day'], '%a, %b %d')}, {fmt_dict_time(rec['start'])} – "
+                            f"{fmt_dict_time(rec['end'])}  ·  +{rec['detour']:.0f} min extra driving")
+                for note in rec["notes"]:
+                    st.caption(f"⚠️ {note}")
+
+    st.markdown("---")
+    csv_data = recs_to_csv(sorted_recs)
+    st.download_button(
+        "⬇️ Download this list (for printing or texting to someone)",
+        data=csv_data,
+        file_name=f"appointment_suggestions_{dt.date.today():%Y-%m-%d}.csv",
+        mime="text/csv",
+        key=f"download_{data.get('generated_at', 'current')}",
+    )
 
 
 # ============================= STREAMLIT UI =================================
 
 st.title("📅 Smart Schedule Finder")
 st.caption("Finds the best open time slot for patients who still need an appointment — based on your existing route and drive times.")
+
+db_conn = get_db_connection()
+
+if "history_view" not in st.session_state:
+    st.session_state.history_view = None
 
 with st.spinner("Connecting to your calendars…"):
     try:
@@ -568,7 +818,6 @@ with st.spinner("Connecting to your calendars…"):
             "Dylan Hendrickson-Work Schedule": "primary"
         }
 
-# Sidebar - Instructions for New Users
 with st.sidebar.expander("📖 How This Works", expanded=False):
     st.markdown("""
     **What it does:** Looks at patients who still need an appointment, checks
@@ -578,19 +827,44 @@ with st.sidebar.expander("📖 How This Works", expanded=False):
     **Steps:**
     1. Pick **which calendar** to search (Wade's, Dylan's, or both).
     2. Choose a **search type**:
-       - *Specific Patient by Name* — look up one person by name (up to 31 days out).
-       - *Batch Schedule* — automatically check the next 14 days for 5 people who still need an appointment.
+       - *One specific patient* — look up one person by name (up to 31 days out).
+       - *Batch* — automatically check the next 14 days for 5 people who still need an appointment.
     3. Check **"Skip today"** if you're working from home and don't want today included.
     4. Click **Run Scheduler**.
 
     **Good to know:**
     - Patients marked "do not schedule" (like out-of-area patients) are automatically left out.
     - Patients with no address on file are left out too, but you'll see who they are.
-    - A note under a suggested time means: double-check that one before booking —
-      it means the appointment length was a guess (no keyword like "hearing test"
-      or "cleaning" was found in the notes).
+    - A note under a suggested time means the appointment length was a guess — worth confirming.
     - Drive times are always calculated from real addresses via Google Maps — those numbers are accurate.
+    - Every search you run is saved. Use **Past Searches** below to look at one again without
+      running it a second time (saves time and doesn't use up any Google Maps lookups).
     """)
+
+with st.sidebar.expander("📜 Past Searches", expanded=False):
+    runs = list_runs(db_conn, limit=25)
+    if not runs:
+        st.caption("No searches yet — run one and it'll show up here.")
+    else:
+        for run_id, created_at, mode, calendar_label in runs:
+            when = dt.datetime.fromisoformat(created_at).strftime("%a %b %d, %I:%M %p").replace(" 0", " ")
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button(f"{when} — {mode} ({calendar_label})", key=f"load_{run_id}", use_container_width=True):
+                    st.session_state.history_view = load_run(db_conn, run_id)
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"del_{run_id}"):
+                    delete_run(db_conn, run_id)
+                    st.rerun()
+
+if st.session_state.history_view:
+    st.info(f"Showing a saved search from earlier — no new lookups were made.")
+    if st.button("🔙 Back to a new search"):
+        st.session_state.history_view = None
+        st.rerun()
+    render_results(st.session_state.history_view)
+    st.stop()
 
 st.sidebar.header("Search Settings")
 cal_options = list(calendar_map.keys())
@@ -620,7 +894,7 @@ if st.sidebar.button("Run Scheduler", type="primary"):
 
         try:
             service = get_calendar_service()
-            estimator = DriveTimeEstimator(MAPS_API_KEY, status_box)
+            estimator = DriveTimeEstimator(MAPS_API_KEY, status_box, db_conn)
 
             today = dt.date.today()
             base_start_date = today + dt.timedelta(days=1) if skip_today else today
@@ -650,11 +924,9 @@ if st.sidebar.button("Run Scheduler", type="primary"):
             else:
                 patients = patients[:5]
 
-            all_recs_list = []
-            all_conflicts: list[tuple[str, ScheduleConflict]] = []
+            recommendations_out: list[dict] = []
+            conflicts_out: list[dict] = []
             seen_conflicts = set()
-            # patient_name -> {cal_name: best_rec}, for comparing employees
-            per_patient_by_cal: dict[str, dict[str, SlotRecommendation]] = {}
 
             for patient in patients:
                 for cal_name, cal_id in target_cal_dict.items():
@@ -672,117 +944,30 @@ if st.sidebar.button("Run Scheduler", type="primary"):
                         dedupe_key = (cal_name, c.day, c.event1_summary, c.event2_summary)
                         if dedupe_key not in seen_conflicts:
                             seen_conflicts.add(dedupe_key)
-                            all_conflicts.append((cal_name, c))
+                            conflicts_out.append(conflict_to_dict(cal_name, c))
 
                     recs = find_slots_for_patient_on_calendar(
                         patient, cal_name, schedule, estimator, current_start_date, current_end_date, max_slots
                     )
                     for r in recs:
-                        all_recs_list.append((cal_name, r))
-
-                    if recs:
-                        per_patient_by_cal.setdefault(patient.name, {})[cal_name] = recs[0]
+                        recommendations_out.append(rec_to_dict(cal_name, r))
 
             status_box.empty()
             st.success("Done!")
 
-            # Surface schedule data problems in plain language, with raw
-            # calendar text rendered safely (st.text, never st.markdown).
-            if all_conflicts:
-                with st.expander(f"⚠️ Heads up: {len(all_conflicts)} double-booked time slot(s) found on the calendar", expanded=True):
-                    st.caption("These are two appointments already scheduled at the same time. "
-                               "Suggestions near these times might not be reliable until this is fixed.")
-                    for cal_name, c in all_conflicts:
-                        st.markdown(f"**{cal_name} — {c.day:%A, %B %d}**")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.caption(f"Starts {c.event1_start.strftime('%I:%M %p').lstrip('0')}")
-                            st.text(clean_display(c.event1_summary, 90))
-                        with col2:
-                            st.caption(f"Overlaps — starts {c.event2_start.strftime('%I:%M %p').lstrip('0')}")
-                            st.text(clean_display(c.event2_summary, 90))
-                        st.divider()
-
-            # Show what got excluded and why, in plain language.
-            if skipped_dns or skipped_no_address:
-                with st.expander(f"ℹ️ {len(skipped_dns) + len(skipped_no_address)} patient(s) not included in this search", expanded=False):
-                    if skipped_dns:
-                        st.markdown("**Marked \"do not schedule\" (e.g. outside our service area):**")
-                        for name in skipped_dns:
-                            st.text(clean_display(name, 90))
-                    if skipped_no_address:
-                        st.markdown("**No address on file — can't calculate driving directions for them:**")
-                        for name in skipped_no_address:
-                            st.text(clean_display(name, 90))
-
-            st.markdown("---")
-            st.subheader("📋 Suggested Appointment Times")
-
-            estimated_cost = (estimator.api_call_count / 1000) * DISTANCE_MATRIX_COST_PER_1000
-            st.caption(
-                f"Checked {estimator.api_call_count} driving routes this search "
-                f"(roughly ${estimated_cost:.2f} in Google Maps usage, before any free monthly credit)."
-            )
-
-            if not all_recs_list:
-                st.warning("No open time slots were found. Try a wider date range, or check the notes above for excluded patients.")
-            else:
-                sorted_recs = sorted(all_recs_list, key=lambda item: item[1].start)
-
-                best_cal, best = sorted_recs[0]
-                start_str = best.start.strftime("%I:%M %p").lstrip("0")
-                end_str = best.end.strftime("%I:%M %p").lstrip("0")
-                date_str = best.day.strftime("%A, %B %d")
-
-                with st.container(border=True):
-                    st.markdown("### ⭐ Best Option")
-                    st.markdown(f"**Patient:** {clean_display(best.patient.name, 80)}")
-                    st.markdown(f"**Employee:** {best_cal}")
-                    st.markdown(f"**When:** {date_str}, {start_str} – {end_str}")
-                    st.caption(f"Adds about {best.detour_min:.0f} extra minutes of driving to that day "
-                               f"({best.drive_before_min:.0f} min drive there, {best.drive_after_min:.0f} min to the next stop)")
-                    for note in best.notes:
-                        st.warning(note, icon="⚠️")
-
-                # Compare employees when both calendars were checked
-                if selected_calendar == "Both Employees Combined" and len(target_cal_dict) > 1:
-                    multi_tech_patients = {n: c for n, c in per_patient_by_cal.items() if len(c) > 1}
-                    if multi_tech_patients:
-                        st.markdown("### 👥 Which Employee Should Take This?")
-                        for pname, cal_recs in multi_tech_patients.items():
-                            ranked = sorted(cal_recs.items(), key=lambda kv: kv[1].detour_min)
-                            best_tech, best_tech_rec = ranked[0]
-                            with st.container(border=True):
-                                st.markdown(f"**{clean_display(pname, 80)}**")
-                                st.markdown(f"Better fit: **{best_tech}** — "
-                                            f"{best_tech_rec.day:%a, %b %d} at "
-                                            f"{best_tech_rec.start.strftime('%I:%M %p').lstrip('0')} "
-                                            f"(+{best_tech_rec.detour_min:.0f} min extra driving)")
-                                for cal_name, rec in ranked[1:]:
-                                    st.caption(f"{cal_name} could also do {rec.day:%a, %b %d} at "
-                                               f"{rec.start.strftime('%I:%M %p').lstrip('0')} "
-                                               f"(+{rec.detour_min:.0f} min extra driving)")
-
-                if len(sorted_recs) > 1:
-                    st.markdown("### Other Times That Would Work")
-                    for cal_name, rec in sorted_recs[1:]:
-                        s_str = rec.start.strftime("%I:%M %p").lstrip("0")
-                        e_str = rec.end.strftime("%I:%M %p").lstrip("0")
-                        d_str = rec.day.strftime("%a, %b %d")
-                        with st.container(border=True):
-                            st.markdown(f"**{clean_display(rec.patient.name, 80)}** — {cal_name}")
-                            st.markdown(f"{d_str}, {s_str} – {e_str}  ·  +{rec.detour_min:.0f} min extra driving")
-                            for note in rec.notes:
-                                st.caption(f"⚠️ {note}")
-
-                st.markdown("---")
-                csv_data = recs_to_csv(sorted_recs)
-                st.download_button(
-                    "⬇️ Download this list (for printing or texting to someone)",
-                    data=csv_data,
-                    file_name=f"appointment_suggestions_{dt.date.today():%Y-%m-%d}.csv",
-                    mime="text/csv",
-                )
+            data = {
+                "generated_at": dt.datetime.now().isoformat(),
+                "mode": mode,
+                "calendar_label": selected_calendar,
+                "api_call_count": estimator.api_call_count,
+                "cache_hit_count": estimator.cache_hit_count,
+                "conflicts": conflicts_out,
+                "skipped_dns": skipped_dns,
+                "skipped_no_address": skipped_no_address,
+                "recommendations": recommendations_out,
+            }
+            save_run(db_conn, mode, selected_calendar, data)
+            render_results(data)
 
         except Exception as e:
             st.error(f"Something went wrong: {e}")
