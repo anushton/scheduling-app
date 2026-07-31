@@ -13,16 +13,14 @@ except ImportError:
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 # ============================= PASSWORD AUTHENTICATION ======================
 
 def check_password():
     """Returns `True` if the user enters the correct password."""
-    
-    # Fetch the password securely from Streamlit secrets
-    correct_password = st.secrets.get("APP_PASSWORD", "")
+    correct_password = st.secrets.get("APP_PASSWORD", "mhs1708")
 
     def password_entered():
         if st.session_state["password"] == correct_password:
@@ -47,50 +45,13 @@ if not check_password():
     st.stop()
 
 
-# ============================= PATH & CONFIG SETUP ==========================
+# ============================= SECURE CONFIG SETUP ==========================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-CREDENTIALS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
-TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
+MAPS_API_KEY = st.secrets.get("MAPS_API_KEY", "")
+OFFICE_ADDRESS = st.secrets.get("OFFICE_ADDRESS", "")
 
-DEFAULT_CONFIG = {
-    "MAPS_API_KEY": st.secrets.get("MAPS_API_KEY", ""),
-    "OFFICE_ADDRESS": st.secrets.get("OFFICE_ADDRESS", ""),
-    "CALENDAR_ID": "primary",
-    "WORKDAY_START_HH_MM": "09:00",
-    "WORKDAY_END_HH_MM": "17:30",
-    "INITIAL_LOOKAHEAD_DAYS": 14,
-    "EXTENDED_LOOKAHEAD_DAYS": 31
-}
-
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=4)
-        return DEFAULT_CONFIG
-    with open(CONFIG_PATH, "r") as f:
-        try:
-            user_config = json.load(f)
-            for key, val in DEFAULT_CONFIG.items():
-                if key not in user_config:
-                    user_config[key] = val
-            return user_config
-        except json.JSONDecodeError:
-            return DEFAULT_CONFIG
-
-CONFIG = load_config()
-
-MAPS_API_KEY = CONFIG["MAPS_API_KEY"]
-OFFICE_ADDRESS = CONFIG["OFFICE_ADDRESS"]
-INITIAL_LOOKAHEAD_DAYS = CONFIG["INITIAL_LOOKAHEAD_DAYS"]
-EXTENDED_LOOKAHEAD_DAYS = CONFIG["EXTENDED_LOOKAHEAD_DAYS"]
-
-start_hr, start_min = map(int, CONFIG["WORKDAY_START_HH_MM"].split(":"))
-WORKDAY_START = dt.time(start_hr, start_min)
-
-end_hr, end_min = map(int, CONFIG["WORKDAY_END_HH_MM"].split(":"))
-WORKDAY_END = dt.time(end_hr, end_min)
+WORKDAY_START = dt.time(9, 0)
+WORKDAY_END = dt.time(17, 30)
 
 WORK_WEEKDAYS = {0, 1, 2, 3, 4}
 UNSCHEDULED_COLOR_ID = "5"
@@ -134,18 +95,32 @@ class SlotRecommendation:
     detour_min: float  
     note: str = ""
 
-from google_auth_oauthlib.flow import Flow
-
 def get_calendar_service():
     creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        
+    
+    # Load from Streamlit secrets token block
+    if "GOOGLE_TOKEN" in st.secrets:
+        token_info = {
+            "token": st.secrets["GOOGLE_TOKEN"].get("token"),
+            "refresh_token": st.secrets["GOOGLE_TOKEN"].get("refresh_token"),
+            "token_uri": st.secrets["GOOGLE_TOKEN"].get("token_uri"),
+            "client_id": st.secrets["GOOGLE_TOKEN"].get("client_id"),
+            "client_secret": st.secrets["GOOGLE_TOKEN"].get("client_secret"),
+            "scopes": list(st.secrets["GOOGLE_TOKEN"].get("scopes", SCOPES)),
+            "universe_domain": st.secrets["GOOGLE_TOKEN"].get("universe_domain", "googleapis.com"),
+            "account": st.secrets["GOOGLE_TOKEN"].get("account", ""),
+            "expiry": st.secrets["GOOGLE_TOKEN"].get("expiry")
+        }
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # Build client config dynamically from Streamlit secrets instead of a local file
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+
+        if not creds:
             client_config = {
                 "installed": {
                     "client_id": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_id"],
@@ -155,23 +130,17 @@ def get_calendar_service():
                     "redirect_uris": ["http://localhost"]
                 }
             }
-            
             flow = Flow.from_client_config(client_config, scopes=SCOPES)
             flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-            
-            # For a cloud web app, authorization requires a web-based OAuth flow.
-            # (If running locally, it prompts in console; on cloud, you'll want to pre-generate and save your token.json locally first).
             auth_url, _ = flow.authorization_url(prompt='consent')
-            st.warning(f"Authorization required. Please visit this URL to authorize: {auth_url}")
+            st.warning(f"Authorization required. Please visit this URL: {auth_url}")
             code = st.text_input("Enter the authorization code:")
             if code:
                 flow.fetch_token(code=code)
                 creds = flow.credentials
-                with open(TOKEN_PATH, "w") as f:
-                    f.write(creds.to_json())
             else:
                 st.stop()
-                
+
     return build("calendar", "v3", credentials=creds)
 
 def get_user_calendars(service) -> dict[str, str]:
@@ -367,9 +336,6 @@ def find_slots_for_patient_on_calendar(
     duration = dt.timedelta(minutes=patient.duration_min)
     now = dt.datetime.now()
 
-    initial_api_calls = estimator.api_call_count
-    last_checked_milestone = 0
-
     day = start_date
     while day <= end_date:
         if day.weekday() not in WORK_WEEKDAYS:
@@ -402,14 +368,6 @@ def find_slots_for_patient_on_calendar(
                 continue
 
             drive_to = estimator.minutes_between(prev_stop.location, patient.location, gap_start)
-            
-            patient_api_calls = estimator.api_call_count - initial_api_calls
-            milestone = (patient_api_calls // 10) * 10
-            if milestone > 0 and milestone > last_checked_milestone and patient_api_calls % 10 == 0:
-                last_checked_milestone = milestone
-                if st.session_state.get(f"pause_{patient.event_id}", False):
-                    return candidates, True
-
             earliest_arrival = gap_start + dt.timedelta(minutes=drive_to)
             appt_end = earliest_arrival + duration
             drive_from = estimator.minutes_between(patient.location, next_stop.location, appt_end)
@@ -448,7 +406,6 @@ with st.spinner("Connecting to calendars..."):
             "Dylan Hendrickson-Work Schedule": "primary"
         }
 
-# Sidebar inputs
 st.sidebar.header("Search Configuration")
 cal_options = list(calendar_map.keys())
 if len(cal_options) > 1:
@@ -512,7 +469,7 @@ if st.sidebar.button("Run Scheduler", type="primary"):
                     
                     if mode == "Specific Patient by Name":
                         current_start_date = base_start_date
-                        current_end_date = current_start_date + dt.timedelta(days=EXTENDED_LOOKAHEAD_DAYS)
+                        current_end_date = current_start_date + dt.timedelta(days=31)
                         schedule = get_days_schedule(service, cal_id, current_start_date, current_end_date)
 
                         recs, _ = find_slots_for_patient_on_calendar(
@@ -521,7 +478,7 @@ if st.sidebar.button("Run Scheduler", type="primary"):
                         for r in recs:
                             all_recs_list.append((cal_name, r))
                     else:
-                        current_end_date = base_start_date + dt.timedelta(days=INITIAL_LOOKAHEAD_DAYS)
+                        current_end_date = base_start_date + dt.timedelta(days=14)
                         schedule = get_days_schedule(service, cal_id, base_start_date, current_end_date)
 
                         recs, _ = find_slots_for_patient_on_calendar(
@@ -533,13 +490,10 @@ if st.sidebar.button("Run Scheduler", type="primary"):
             status_box.empty()
             st.success("Run Completed Successfully!")
 
-            # Display Results
             st.markdown("---")
             st.subheader("📋 Scheduling Recommendations")
             
-            # Quota info
-            free_limit = 10000
-            estimated_cost = max(0, (estimator.api_call_count - free_limit)) * 0.005 if estimator.api_call_count > free_limit else 0.0
+            estimated_cost = max(0, (estimator.api_call_count - 10000)) * 0.005 if estimator.api_call_count > 10000 else 0.0
             st.info(f"**API Usage:** {estimator.api_call_count} requests made | Estimated Cost: ${estimated_cost:.2f}")
 
             if not all_recs_list:
