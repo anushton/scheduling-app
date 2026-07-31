@@ -51,8 +51,8 @@ CREDENTIALS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
 
 DEFAULT_CONFIG = {
-    "MAPS_API_KEY": "",
-    "OFFICE_ADDRESS": "3541 E Elgin St, Gilbert, AZ 85234",
+    "MAPS_API_KEY": st.secrets.get("MAPS_API_KEY", ""),
+    "OFFICE_ADDRESS": st.secrets.get("OFFICE_ADDRESS", ""),
     "CALENDAR_ID": "primary",
     "WORKDAY_START_HH_MM": "09:00",
     "WORKDAY_END_HH_MM": "17:30",
