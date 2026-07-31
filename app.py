@@ -134,20 +134,44 @@ class SlotRecommendation:
     detour_min: float  
     note: str = ""
 
+from google_auth_oauthlib.flow import Flow
+
 def get_calendar_service():
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not os.path.exists(CREDENTIALS_PATH):
-                raise FileNotFoundError(f"Couldn't find credentials.json at {CREDENTIALS_PATH}")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
+            # Build client config dynamically from Streamlit secrets instead of a local file
+            client_config = {
+                "installed": {
+                    "client_id": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_id"],
+                    "client_secret": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_secret"],
+                    "auth_uri": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["auth_uri"],
+                    "token_uri": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["token_uri"],
+                    "redirect_uris": ["http://localhost"]
+                }
+            }
+            
+            flow = Flow.from_client_config(client_config, scopes=SCOPES)
+            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+            
+            # For a cloud web app, authorization requires a web-based OAuth flow.
+            # (If running locally, it prompts in console; on cloud, you'll want to pre-generate and save your token.json locally first).
+            auth_url, _ = flow.authorization_url(prompt='consent')
+            st.warning(f"Authorization required. Please visit this URL to authorize: {auth_url}")
+            code = st.text_input("Enter the authorization code:")
+            if code:
+                flow.fetch_token(code=code)
+                creds = flow.credentials
+                with open(TOKEN_PATH, "w") as f:
+                    f.write(creds.to_json())
+            else:
+                st.stop()
+                
     return build("calendar", "v3", credentials=creds)
 
 def get_user_calendars(service) -> dict[str, str]:
