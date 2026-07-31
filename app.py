@@ -136,8 +136,21 @@ def get_calendar_service():
             st.warning(f"Authorization required. Please visit this URL: {auth_url}")
             code = st.text_input("Enter the authorization code:")
             if code:
-                flow.fetch_token(code=code)
-                creds = flow.credentials
+                try:
+                    flow.fetch_token(code=code)
+                    creds = flow.credentials
+                except Exception as e:
+                    st.error(
+                        "Couldn't exchange that code for a token "
+                        f"({e}). Note: Google has been phasing out the "
+                        "copy/paste 'out-of-band' code flow for OAuth clients "
+                        "created after Feb 2022 — if this keeps failing, the "
+                        "fix is to generate a token.json once locally (e.g. "
+                        "using InstalledAppFlow.run_local_server() in a "
+                        "one-off script on your own machine) and paste its "
+                        "contents into the GOOGLE_TOKEN secret instead."
+                    )
+                    st.stop()
             else:
                 st.stop()
 
@@ -158,8 +171,9 @@ def get_user_calendars(service) -> dict[str, str]:
             page_token = calendar_list.get("nextPageToken")
             if not page_token:
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"Couldn't load your calendar list ({e}). Using default calendars instead — "
+                   "if these aren't right, check that the account has calendar access.")
     
     if not calendars:
         calendars["Wade Hendrickson"] = "w1a9d7e4@gmail.com"
@@ -193,7 +207,7 @@ def get_unscheduled_patients(service) -> list[Patient]:
                 maxResults=250,
                 pageToken=page_token,
             ).execute()
-        except Exception:
+        except Exception as e:
             try:
                 resp = service.events().list(
                     calendarId="primary",
@@ -204,7 +218,13 @@ def get_unscheduled_patients(service) -> list[Patient]:
                     maxResults=250,
                     pageToken=page_token,
                 ).execute()
-            except Exception:
+            except Exception as e2:
+                st.error(
+                    f"Couldn't fetch unscheduled patients from either "
+                    f"'{target_cal_id}' or 'primary' ({e2}). Results below "
+                    "will be incomplete or empty — this isn't a 'no patients "
+                    "found' result, it's a failed fetch."
+                )
                 break
 
         for e in resp.get("items", []):
@@ -232,7 +252,16 @@ def get_unscheduled_patients(service) -> list[Patient]:
             break
     return patients
 
+# Cache of already-fetched calendar schedules for this run, keyed by
+# (calendar_id, start_date, end_date) — avoids re-fetching the same
+# calendar's events once per patient when batching multiple patients.
+_schedule_cache: dict[tuple[str, dt.date, dt.date], dict[dt.date, list[Stop]]] = {}
+
 def get_days_schedule(service, calendar_id: str, start_date: dt.date, end_date: dt.date) -> dict[dt.date, list[Stop]]:
+    cache_key = (calendar_id, start_date, end_date)
+    if cache_key in _schedule_cache:
+        return _schedule_cache[cache_key]
+
     time_min = dt.datetime.combine(start_date, dt.time.min).isoformat() + "Z"
     time_max = dt.datetime.combine(end_date, dt.time.max).isoformat() + "Z"
 
@@ -249,7 +278,13 @@ def get_days_schedule(service, calendar_id: str, start_date: dt.date, end_date: 
                 maxResults=250,
                 pageToken=page_token,
             ).execute()
-        except Exception:
+        except Exception as e:
+            st.error(
+                f"Couldn't fetch the existing schedule for calendar "
+                f"'{calendar_id}' ({e}). Any recommendation below for this "
+                "calendar may be treating busy days as open — verify before "
+                "booking."
+            )
             break
 
         for e in resp.get("items", []):
@@ -271,6 +306,8 @@ def get_days_schedule(service, calendar_id: str, start_date: dt.date, end_date: 
 
     for day in schedule:
         schedule[day].sort(key=lambda st: st.start)
+
+    _schedule_cache[cache_key] = schedule
     return schedule
 
 class DriveTimeEstimator:
@@ -317,8 +354,13 @@ def is_text_in_same_area(loc1: str, loc2: str) -> bool:
     z1 = set(re.findall(r'\b85\d{3}\b', t1))
     z2 = set(re.findall(r'\b85\d{3}\b', t2))
     if z1 and z2 and (z1 & z2): return True
-    cities = ["glendale", "goodyear", "peoria", "phoenix", "phx", "scottsdale", "scotts", 
-              "sun city", "surprise", "avondale", "mesa", "tempe", "chandler", "gilbert"]
+    cities = [
+        "glendale", "goodyear", "peoria", "phoenix", "phx", "scottsdale", "scotts",
+        "sun city", "surprise", "avondale", "mesa", "tempe", "chandler", "gilbert",
+        "buckeye", "litchfield park", "litchfield", "paradise valley", "queen creek",
+        "tucson", "youngtown", "el mirage", "waddell", "apache junction", "tolleson",
+        "fountain hills", "cave creek", "carefree", "wickenburg", "florence", "casa grande",
+    ]
     for c in cities:
         if c in t1 and c in t2: return True
     return False
@@ -401,6 +443,8 @@ with st.spinner("Connecting to calendars..."):
         service = get_calendar_service()
         calendar_map = get_user_calendars(service)
     except Exception as e:
+        st.warning(f"Couldn't connect to Google Calendar ({e}). Falling back to default calendar list — "
+                   "the app may not be able to fetch real data until this is resolved.")
         calendar_map = {
             "Wade Hendrickson": "w1a9d7e4@gmail.com",
             "Dylan Hendrickson-Work Schedule": "primary"
