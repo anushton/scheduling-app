@@ -406,6 +406,21 @@ with st.spinner("Connecting to calendars..."):
             "Dylan Hendrickson-Work Schedule": "primary"
         }
 
+# Sidebar - Instructions for New Users
+with st.sidebar.expander("📖 How to Use & What It Does", expanded=False):
+    st.markdown("""
+    **What this app does:**
+    This tool optimizes travel schedules by automatically scanning your Google Calendars and checking live traffic data (via Google Maps) to find the most efficient appointment slots for patients, minimizing unnecessary drive time and detours.
+
+    **How to use it:**
+    1. **Target Calendar:** Select the calendar you want to scan (or combine both).
+    2. **Search Mode:** 
+       * *Specific Patient by Name:* Type a patient's name to search for open slots up to 31 days out. You can also supply an optional override address.
+       * *Batch Schedule:* Automatically scans the next 14 days for your top unscheduled patients.
+    3. **Skip Today:** Check this box if working from home today to push route calculations starting tomorrow.
+    4. **Run Scheduler:** Click the button to calculate optimal driving routes and view recommended appointment windows instantly.
+    """)
+
 st.sidebar.header("Search Configuration")
 cal_options = list(calendar_map.keys())
 if len(cal_options) > 1:
