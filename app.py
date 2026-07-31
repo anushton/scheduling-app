@@ -20,7 +20,7 @@ from googleapiclient.discovery import build
 
 def check_password():
     """Returns `True` if the user enters the correct password."""
-    correct_password = st.secrets.get("APP_PASSWORD", "mhs1708")
+    correct_password = st.secrets["APP_PASSWORD"]
 
     def password_entered():
         if st.session_state["password"] == correct_password:
