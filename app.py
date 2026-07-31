@@ -511,8 +511,6 @@ def find_slots_for_patient_on_calendar(
                 notes = []
                 if patient.duration_guessed:
                     notes.append("We guessed how long this appointment should be — please confirm.")
-                if overall_confidence == "city":
-                    notes.append("Location match is approximate (based on city name, not an exact address) — double-check before booking.")
 
                 candidates.append(SlotRecommendation(
                     patient=patient, calendar_name=calendar_name, day=day, start=earliest_arrival, end=appt_end,
@@ -536,7 +534,7 @@ def recs_to_csv(all_recs_list: list[tuple[str, SlotRecommendation]]) -> str:
     writer.writerow([
         "Patient", "Employee", "Date", "Start Time", "End Time",
         "Drive There (min)", "Drive To Next Stop (min)", "Extra Drive Time Added (min)",
-        "Location Match", "Notes",
+        "Notes",
     ])
     for cal_name, rec in all_recs_list:
         writer.writerow([
@@ -548,7 +546,6 @@ def recs_to_csv(all_recs_list: list[tuple[str, SlotRecommendation]]) -> str:
             f"{rec.drive_before_min:.0f}",
             f"{rec.drive_after_min:.0f}",
             f"{rec.detour_min:.0f}",
-            "Exact zip match" if rec.area_confidence == "zip" else ("Same as office" if rec.area_confidence == "office" else "Approximate"),
             " / ".join(rec.notes),
         ])
     return buf.getvalue()
@@ -589,8 +586,10 @@ with st.sidebar.expander("📖 How This Works", expanded=False):
     **Good to know:**
     - Patients marked "do not schedule" (like out-of-area patients) are automatically left out.
     - Patients with no address on file are left out too, but you'll see who they are.
-    - A note under a suggested time means: double-check that one before booking — either the
-      appointment length was a guess, or the location match wasn't exact.
+    - A note under a suggested time means: double-check that one before booking —
+      it means the appointment length was a guess (no keyword like "hearing test"
+      or "cleaning" was found in the notes).
+    - Drive times are always calculated from real addresses via Google Maps — those numbers are accurate.
     """)
 
 st.sidebar.header("Search Settings")
