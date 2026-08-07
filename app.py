@@ -332,18 +332,31 @@ def recently_checked_ids(conn, days: int) -> set:
 
 
 def get_calendar_service():
+    # 1. Check session state first so credentials survive app reruns
+    if "valid_creds" in st.session_state:
+        return build("calendar", "v3", credentials=st.session_state["valid_creds"])
+
     creds = None
     if "GOOGLE_TOKEN" in st.secrets:
+        token_data = dict(st.secrets["GOOGLE_TOKEN"])
+        
+        # Ensure expiry is converted back to a datetime object if stored as a string
+        if "expiry" in token_data and isinstance(token_data["expiry"], str):
+            try:
+                token_data["expiry"] = dt.datetime.fromisoformat(token_data["expiry"].replace("Z", "+00:00"))
+            except Exception:
+                pass
+                
         token_info = {
-            "token": st.secrets["GOOGLE_TOKEN"].get("token"),
-            "refresh_token": st.secrets["GOOGLE_TOKEN"].get("refresh_token"),
-            "token_uri": st.secrets["GOOGLE_TOKEN"].get("token_uri"),
-            "client_id": st.secrets["GOOGLE_TOKEN"].get("client_id"),
-            "client_secret": st.secrets["GOOGLE_TOKEN"].get("client_secret"),
-            "scopes": list(st.secrets["GOOGLE_TOKEN"].get("scopes", SCOPES)),
-            "universe_domain": st.secrets["GOOGLE_TOKEN"].get("universe_domain", "googleapis.com"),
-            "account": st.secrets["GOOGLE_TOKEN"].get("account", ""),
-            "expiry": st.secrets["GOOGLE_TOKEN"].get("expiry")
+            "token": token_data.get("token"),
+            "refresh_token": token_data.get("refresh_token"),
+            "token_uri": token_data.get("token_uri"),
+            "client_id": token_data.get("client_id"),
+            "client_secret": token_data.get("client_secret"),
+            "scopes": list(token_data.get("scopes", SCOPES)),
+            "universe_domain": token_data.get("universe_domain", "googleapis.com"),
+            "account": token_data.get("account", ""),
+            "expiry": token_data.get("expiry")
         }
         creds = Credentials.from_authorized_user_info(token_info, SCOPES)
 
@@ -366,28 +379,45 @@ def get_calendar_service():
                     }
                 }
                 new_flow = Flow.from_client_config(client_config, scopes=SCOPES)
-                new_flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-                auth_url, _ = new_flow.authorization_url(prompt='consent')
-                # The Flow object (and the secret "code_verifier" it just
-                # generated for this login attempt) has to be the SAME
-                # object used later to redeem the code — Streamlit reruns
-                # this whole script on every interaction, so a fresh local
-                # variable here would silently regenerate a new, mismatched
-                # secret every time the user typed. Stashing it in
-                # session_state keeps the one actually tied to the link
-                # below alive across those reruns.
+                new_flow.redirect_uri = "http://localhost"  # Using the corrected redirect_uri
+                auth_url, _ = new_flow.authorization_url(prompt='consent', access_type='offline')
                 st.session_state["oauth_flow"] = new_flow
                 st.session_state["oauth_url"] = auth_url
 
             flow = st.session_state["oauth_flow"]
             st.warning(f"One-time setup needed. Open this link, sign in, and copy the code it gives you: {st.session_state['oauth_url']}")
             code = st.text_input("Paste the code here:")
+            
             if code:
                 try:
                     flow.fetch_token(code=code.strip())
                     creds = flow.credentials
                     del st.session_state["oauth_flow"]
                     del st.session_state["oauth_url"]
+                    
+                    # 2. Output the exact TOML for the secrets file
+                    st.success("Successfully authenticated!")
+                    st.markdown("### ⚠️ Final Step: Save Your New Token")
+                    st.write("To prevent having to do this again, copy the block below and replace the `[GOOGLE_TOKEN]` section in your `.streamlit/secrets.toml` or Streamlit Cloud Settings:")
+                    
+                    expiry_str = creds.expiry.isoformat() + "Z" if creds.expiry else ""
+                    scopes_str = str(creds.scopes).replace("'", '"')
+                    
+                    toml_code = f"""[GOOGLE_TOKEN]
+token = "{creds.token}"
+refresh_token = "{creds.refresh_token}"
+token_uri = "{creds.token_uri}"
+client_id = "{creds.client_id}"
+client_secret = "{creds.client_secret}"
+scopes = {scopes_str}
+universe_domain = "{creds.universe_domain}"
+account = ""
+expiry = "{expiry_str}"
+"""
+                    st.code(toml_code, language="toml")
+                    st.info("Once you have updated your secrets, **clear the text box above** and hit Enter to use the app.")
+                    st.stop()
+                    
                 except Exception:
                     st.error(
                         "That code didn't work. Codes can only be used once — if you "
@@ -402,6 +432,8 @@ def get_calendar_service():
             else:
                 st.stop()
 
+    # Save successful credentials to session state for the rest of the session
+    st.session_state["valid_creds"] = creds
     return build("calendar", "v3", credentials=creds)
 
 
