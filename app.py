@@ -328,11 +328,16 @@ def get_calendar_service():
     if "GOOGLE_TOKEN" in st.secrets:
         token_data = dict(st.secrets["GOOGLE_TOKEN"])
         
-        if "expiry" in token_data and isinstance(token_data["expiry"], str):
-            try:
-                token_data["expiry"] = dt.datetime.fromisoformat(token_data["expiry"].replace("Z", "+00:00"))
-            except Exception:
-                pass
+        # Ensure expiry is ALWAYS a string before handing it to Google Auth
+        expiry_val = token_data.get("expiry")
+        if isinstance(expiry_val, dt.datetime):
+            # If Streamlit auto-parsed it, turn it back into an ISO string
+            expiry_val = expiry_val.isoformat().replace("+00:00", "")
+            if not expiry_val.endswith("Z"):
+                expiry_val += "Z"
+        elif isinstance(expiry_val, str) and expiry_val:
+            if not expiry_val.endswith("Z") and "+" not in expiry_val:
+                expiry_val += "Z"
                 
         token_info = {
             "token": token_data.get("token"),
@@ -343,7 +348,7 @@ def get_calendar_service():
             "scopes": list(token_data.get("scopes", SCOPES)),
             "universe_domain": token_data.get("universe_domain", "googleapis.com"),
             "account": token_data.get("account", ""),
-            "expiry": token_data.get("expiry")
+            "expiry": str(expiry_val) if expiry_val else None
         }
         creds = Credentials.from_authorized_user_info(token_info, SCOPES)
 
