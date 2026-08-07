@@ -355,26 +355,49 @@ def get_calendar_service():
                 creds = None
 
         if not creds:
-            client_config = {
-                "installed": {
-                    "client_id": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_id"],
-                    "client_secret": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_secret"],
-                    "auth_uri": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["auth_uri"],
-                    "token_uri": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["token_uri"],
-                    "redirect_uris": ["http://localhost"]
+            if "oauth_flow" not in st.session_state:
+                client_config = {
+                    "installed": {
+                        "client_id": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_id"],
+                        "client_secret": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["client_secret"],
+                        "auth_uri": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["auth_uri"],
+                        "token_uri": st.secrets["GOOGLE_CREDENTIALS"]["installed"]["token_uri"],
+                        "redirect_uris": ["http://localhost"]
+                    }
                 }
-            }
-            flow = Flow.from_client_config(client_config, scopes=SCOPES)
-            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-            auth_url, _ = flow.authorization_url(prompt='consent')
-            st.warning(f"One-time setup needed. Open this link, sign in, and copy the code it gives you: {auth_url}")
+                new_flow = Flow.from_client_config(client_config, scopes=SCOPES)
+                new_flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+                auth_url, _ = new_flow.authorization_url(prompt='consent')
+                # The Flow object (and the secret "code_verifier" it just
+                # generated for this login attempt) has to be the SAME
+                # object used later to redeem the code — Streamlit reruns
+                # this whole script on every interaction, so a fresh local
+                # variable here would silently regenerate a new, mismatched
+                # secret every time the user typed. Stashing it in
+                # session_state keeps the one actually tied to the link
+                # below alive across those reruns.
+                st.session_state["oauth_flow"] = new_flow
+                st.session_state["oauth_url"] = auth_url
+
+            flow = st.session_state["oauth_flow"]
+            st.warning(f"One-time setup needed. Open this link, sign in, and copy the code it gives you: {st.session_state['oauth_url']}")
             code = st.text_input("Paste the code here:")
             if code:
                 try:
-                    flow.fetch_token(code=code)
+                    flow.fetch_token(code=code.strip())
                     creds = flow.credentials
+                    del st.session_state["oauth_flow"]
+                    del st.session_state["oauth_url"]
                 except Exception:
-                    st.error("That code didn't work. If this keeps happening, contact whoever set up this app.")
+                    st.error(
+                        "That code didn't work. Codes can only be used once — if you "
+                        "reloaded the page or tried more than once, click the button "
+                        "below to get a fresh link and try again with a brand new code."
+                    )
+                    if st.button("Get a new sign-in link"):
+                        del st.session_state["oauth_flow"]
+                        del st.session_state["oauth_url"]
+                        st.rerun()
                     st.stop()
             else:
                 st.stop()
