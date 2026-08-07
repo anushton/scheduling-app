@@ -624,25 +624,6 @@ class DriveTimeEstimator:
         return minutes
 
 
-def area_match(loc1: str, loc2: str) -> tuple[bool, str]:
-    t1, t2 = loc1.lower(), loc2.lower()
-    z1 = set(re.findall(r'\b85\d{3}\b', t1))
-    z2 = set(re.findall(r'\b85\d{3}\b', t2))
-    if z1 and z2 and (z1 & z2):
-        return True, "zip"
-    cities = [
-        "glendale", "goodyear", "peoria", "phoenix", "phx", "scottsdale", "scotts",
-        "sun city", "surprise", "avondale", "mesa", "tempe", "chandler", "gilbert",
-        "buckeye", "litchfield park", "litchfield", "paradise valley", "queen creek",
-        "tucson", "youngtown", "el mirage", "waddell", "apache junction", "tolleson",
-        "fountain hills", "cave creek", "carefree", "wickenburg", "florence", "casa grande",
-    ]
-    for c in cities:
-        if c in t1 and c in t2:
-            return True, "city"
-    return False, "none"
-
-
 def _enumerate_valid_gaps(schedule, start_date, end_date, workday_hours, patient_location, now):
     results = []
     day = start_date
@@ -669,12 +650,8 @@ def _enumerate_valid_gaps(schedule, start_date, end_date, workday_hours, patient
             if gap_start < day_start: gap_start = day_start
             if gap_end <= gap_start: continue
 
-            if prev_stop.location != OFFICE_ADDRESS:
-                matched, _ = area_match(prev_stop.location, patient_location)
-                if not matched: continue
-            if next_stop.location != OFFICE_ADDRESS:
-                matched, _ = area_match(next_stop.location, patient_location)
-                if not matched: continue
+            # Strict string-based area matching removed to allow adjacent locations 
+            # (like Phoenix and Glendale) to be evaluated dynamically by actual drive times.
 
             results.append((day, prev_stop, next_stop, gap_start, gap_end))
         day += dt.timedelta(days=1)
@@ -700,9 +677,19 @@ def find_slots_for_patient_on_calendar(
     candidates: list[SlotRecommendation] = []
     for day, prev_stop, next_stop, gap_start, gap_end in valid_gaps:
         drive_to = estimator.minutes_between(prev_stop.location, patient.location, gap_start)
+        
+        # Enforce max 30-minute drive rule between stops
+        if prev_stop.location != OFFICE_ADDRESS and drive_to > 30.0:
+            continue
+
         earliest_arrival = gap_start + dt.timedelta(minutes=drive_to)
         appt_end = earliest_arrival + duration
         drive_from = estimator.minutes_between(patient.location, next_stop.location, appt_end)
+        
+        # Enforce max 30-minute drive rule between stops
+        if next_stop.location != OFFICE_ADDRESS and drive_from > 30.0:
+            continue
+
         required_departure = appt_end + dt.timedelta(minutes=drive_from)
 
         if required_departure <= gap_end:
@@ -727,7 +714,6 @@ def find_slots_for_patient_on_calendar(
 
 def explain_no_slot(patient: Patient, combined_stops, start_date: dt.date, end_date: dt.date, workday_hours: dict) -> str:
     duration = dt.timedelta(minutes=patient.duration_min)
-    any_area_match = False
     any_big_gap = False
 
     day = start_date
@@ -738,13 +724,6 @@ def explain_no_slot(patient: Patient, combined_stops, start_date: dt.date, end_d
             continue
 
         stops = combined_stops.get(day, [])
-        for s in stops:
-            if s.location == OFFICE_ADDRESS:
-                continue
-            matched, _ = area_match(s.location, patient.location)
-            if matched:
-                any_area_match = True
-
         day_start = dt.datetime.combine(day, parse_hhmm(cfg["start"]))
         day_end = dt.datetime.combine(day, parse_hhmm(cfg["end"]))
         timeline = [Stop(day_start, day_start, OFFICE_ADDRESS, "")] + stops + [Stop(day_end, day_end, OFFICE_ADDRESS, "")]
@@ -754,11 +733,9 @@ def explain_no_slot(patient: Patient, combined_stops, start_date: dt.date, end_d
 
         day += dt.timedelta(days=1)
 
-    if not any_area_match:
-        return "None of your scheduled route days in this window pass near this patient's area (no matching city or zip code found nearby)."
     if not any_big_gap:
-        return "Your route days near this area are already full — no gap long enough for this appointment without bumping something else."
-    return "A time gap exists nearby, but the drive time to/from this stop doesn't fit in the available window. Try a different day or check manually."
+        return "Your route days are fully booked — no gap long enough for this appointment without bumping something else."
+    return "Time gaps exist, but nearby stops exceed the 30-minute drive-time limit or don't fit within available working hours."
 
 
 # ============================= DICT CONVERSION ================================
@@ -819,7 +796,6 @@ def get_google_maps_url(rec: dict) -> str:
     day_stops = rec.get("day_stops", [])
     suggested_loc = rec.get("patient_location", "")
     
-    # Combine existing day stops and the suggested stop, sorted chronologically by start time
     all_stops = [dict(s, is_suggested=False) for s in day_stops]
     if suggested_loc:
         all_stops.append({
