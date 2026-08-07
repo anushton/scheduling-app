@@ -476,6 +476,4 @@ It focuses on making appointment scheduling faster by combining:
 
 ## 📄 License
 
-Add the license that best fits your project.
 
-For a private/internal business application, you may choose not to publish a license and keep the repository private.
