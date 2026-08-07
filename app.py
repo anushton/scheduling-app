@@ -82,10 +82,6 @@ DEFAULT_SETTINGS = {
     ],
 }
 
-# NOTE: if this app is deployed somewhere with an ephemeral filesystem (gets
-# rebuilt from scratch on redeploy), this database — and everything in it
-# (history, caches, settings) — resets when that happens. It persists fine
-# across normal day-to-day usage and restarts in between.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "schedule_history.db")
 
@@ -99,9 +95,9 @@ class Patient:
     duration_min: int
     raw_summary: str
     calendar_id: str
-    created_at: str = ""            # from the calendar event's "created" field, used to sort by longest-waiting
-    duration_guessed: bool = False  # True if no keyword matched, used the default
-    duration_overridden: bool = False  # True if the user manually set the length for this search
+    created_at: str = ""
+    duration_guessed: bool = False
+    duration_overridden: bool = False
 
 @dataclass
 class Stop:
@@ -133,10 +129,6 @@ class ScheduleConflict:
 
 
 def clean_display(text: str, max_len: int = 100) -> str:
-    """Collapse messy whitespace and trim raw calendar notes to a readable
-    length. Only ever pass this to st.text()/st.code() (never st.markdown) —
-    raw notes can contain $ signs or stray */_ characters that Streamlit's
-    markdown renderer would try to interpret as formatting."""
     text = " ".join((text or "").split())
     if len(text) > max_len:
         text = text[:max_len].rstrip() + "…"
@@ -149,8 +141,6 @@ def parse_hhmm(s: str) -> dt.time:
 
 
 def decode_polyline(polyline_str: str) -> list[tuple[float, float]]:
-    """Standard Google polyline decoding (self-contained, no dependency on
-    googlemaps' internal helpers). Returns a list of (lat, lng) points."""
     index, lat, lng = 0, 0, 0
     coordinates = []
     while index < len(polyline_str):
@@ -301,7 +291,7 @@ def get_settings(conn) -> dict:
         except Exception:
             pass
     save_settings(conn, DEFAULT_SETTINGS)
-    return json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+    return json.loads(json.dumps(DEFAULT_SETTINGS))  
 
 
 def save_settings(conn, settings: dict):
@@ -330,9 +320,7 @@ def recently_checked_ids(conn, days: int) -> set:
 
 # ============================================================================
 
-
 def get_calendar_service():
-    # 1. Check session state first so credentials survive app reruns
     if "valid_creds" in st.session_state:
         return build("calendar", "v3", credentials=st.session_state["valid_creds"])
 
@@ -340,7 +328,6 @@ def get_calendar_service():
     if "GOOGLE_TOKEN" in st.secrets:
         token_data = dict(st.secrets["GOOGLE_TOKEN"])
         
-        # Ensure expiry is converted back to a datetime object if stored as a string
         if "expiry" in token_data and isinstance(token_data["expiry"], str):
             try:
                 token_data["expiry"] = dt.datetime.fromisoformat(token_data["expiry"].replace("Z", "+00:00"))
@@ -379,7 +366,7 @@ def get_calendar_service():
                     }
                 }
                 new_flow = Flow.from_client_config(client_config, scopes=SCOPES)
-                new_flow.redirect_uri = "http://localhost"  # Using the corrected redirect_uri
+                new_flow.redirect_uri = "http://localhost"  
                 auth_url, _ = new_flow.authorization_url(prompt='consent', access_type='offline')
                 st.session_state["oauth_flow"] = new_flow
                 st.session_state["oauth_url"] = auth_url
@@ -395,7 +382,6 @@ def get_calendar_service():
                     del st.session_state["oauth_flow"]
                     del st.session_state["oauth_url"]
                     
-                    # 2. Output the exact TOML for the secrets file
                     st.success("Successfully authenticated!")
                     st.markdown("### ⚠️ Final Step: Save Your New Token")
                     st.write("To prevent having to do this again, copy the block below and replace the `[GOOGLE_TOKEN]` section in your `.streamlit/secrets.toml` or Streamlit Cloud Settings:")
@@ -432,7 +418,6 @@ expiry = "{expiry_str}"
             else:
                 st.stop()
 
-    # Save successful credentials to session state for the rest of the session
     st.session_state["valid_creds"] = creds
     return build("calendar", "v3", credentials=creds)
 
@@ -596,12 +581,6 @@ def _chunked(lst, n):
 
 
 class DriveTimeEstimator:
-    """Checks the in-memory cache, then the persistent SQLite cache (shared
-    across runs/sessions), and only calls the Google Maps API for anything
-    still missing — via batch_prime(), which groups many routes into a
-    handful of native multi-origin/destination requests instead of one
-    network round-trip per route."""
-
     def __init__(self, api_key: str, status_box, conn):
         self.client = googlemaps.Client(key=api_key) if (api_key and googlemaps) else None
         self.cache: dict[tuple[str, str], float] = {}
@@ -613,12 +592,6 @@ class DriveTimeEstimator:
     def batch_prime(self, pairs: list[tuple[str, str, dt.datetime]]):
         if not self.client or not pairs:
             return
-        # Group by hour-of-day rather than exact date+hour: the same time
-        # slot (e.g. "9am departure") recurs across many different days in
-        # a search, and Google's traffic model for a future date is already
-        # just a typical-pattern estimate for that time of day — so grouping
-        # this way lets far more pairs collapse into a single batched call
-        # without meaningfully changing the accuracy of the estimate.
         buckets: dict[int, set] = {}
         bucket_time: dict[int, dt.datetime] = {}
         for origin, destination, depart_at in pairs:
@@ -660,7 +633,7 @@ class DriveTimeEstimator:
                                 self.cache[(o, d)] = minutes
                                 save_drive_time_to_cache(self.conn, o, d, minutes)
                     except Exception:
-                        pass  # any pair still missing after this falls back to minutes_between()
+                        pass  
 
     def minutes_between(self, origin: str, destination: str, depart_at: dt.datetime) -> float:
         if origin == destination:
@@ -720,9 +693,6 @@ def area_match(loc1: str, loc2: str) -> tuple[bool, str]:
 
 
 def _enumerate_valid_gaps(schedule, start_date, end_date, workday_hours, patient_location, now):
-    """Walks every workday in range and returns (day, prev_stop, next_stop,
-    gap_start, gap_end) for every gap worth considering — filtered by
-    working days/hours and a same-area check, but with NO API calls."""
     results = []
     day = start_date
     while day <= end_date:
@@ -805,8 +775,6 @@ def find_slots_for_patient_on_calendar(
 
 
 def explain_no_slot(patient: Patient, combined_stops, start_date: dt.date, end_date: dt.date, workday_hours: dict) -> str:
-    """Only called for patients who got zero recommendations — gives a
-    plain-language reason instead of a silent gap in the results."""
     duration = dt.timedelta(minutes=patient.duration_min)
     any_area_match = False
     any_big_gap = False
@@ -1174,10 +1142,10 @@ with tab_settings:
 
 with tab_scheduler:
     with st.spinner("Connecting to your calendars…"):
+        service = get_calendar_service() 
         try:
-            service = get_calendar_service()
             calendar_map = get_user_calendars(service)
-        except Exception:
+        except Exception as e:
             st.warning("Couldn't connect to Google Calendar right now. Using the saved default calendars — results may not be accurate until this is fixed.")
             calendar_map = {"Wade Hendrickson": "w1a9d7e4@gmail.com", "Dylan Hendrickson-Work Schedule": "primary"}
 
@@ -1300,7 +1268,7 @@ else:
                                 patients[0].duration_guessed = False
                                 patients[0].duration_overridden = True
                     else:
-                        patients.sort(key=lambda p: p.created_at or "")  # oldest first = longest waiting
+                        patients.sort(key=lambda p: p.created_at or "")  
                         if skip_recent:
                             recent_ids = recently_checked_ids(db_conn, days=7)
                             patients = [p for p in patients if p.event_id not in recent_ids]
