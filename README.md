@@ -476,4 +476,11 @@ It focuses on making appointment scheduling faster by combining:
 
 ## 📄 License
 
+Copyright © 2026 Ashton Hendrickson. All rights reserved.
+
+This project is proprietary software. The source code may be viewed for reference, but may not be copied, modified, distributed, published, or used without prior written permission from the copyright holder.
+
+See the [`LICENSE`](LICENSE) file for the complete license terms.
+
+
 
