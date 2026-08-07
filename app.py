@@ -806,15 +806,23 @@ def get_google_maps_url(rec: dict) -> str:
         })
     all_stops.sort(key=lambda s: s.get("start") or "")
     
-    waypoints = [s["location"] for s in all_stops if s.get("location")]
+    # Filter out empty strings and OFFICE_ADDRESS defaults used as placeholders for locationless events
+    raw_waypoints = [s.get("location", "").strip() for s in all_stops]
+    valid_waypoints = [loc for loc in raw_waypoints if loc and loc != OFFICE_ADDRESS]
+    
+    # Deduplicate consecutive identical waypoints
+    deduped_waypoints = []
+    for loc in valid_waypoints:
+        if not deduped_waypoints or deduped_waypoints[-1] != loc:
+            deduped_waypoints.append(loc)
     
     base_url = "https://www.google.com/maps/dir/?api=1"
     params = {
         "origin": OFFICE_ADDRESS,
         "destination": OFFICE_ADDRESS,
     }
-    if waypoints:
-        params["waypoints"] = "|".join(waypoints)
+    if deduped_waypoints:
+        params["waypoints"] = "|".join(deduped_waypoints)
         
     return base_url + "&" + urllib.parse.urlencode(params)
 
