@@ -4,10 +4,10 @@ import io
 import csv
 import json
 import sqlite3
+import urllib.parse
 import datetime as dt
 from dataclasses import dataclass, field
 import pandas as pd
-import pydeck as pdk
 import streamlit as st
 
 try:
@@ -140,28 +140,6 @@ def parse_hhmm(s: str) -> dt.time:
     return dt.time(int(h), int(m))
 
 
-def decode_polyline(polyline_str: str) -> list[tuple[float, float]]:
-    index, lat, lng = 0, 0, 0
-    coordinates = []
-    while index < len(polyline_str):
-        for unit in ("lat", "lng"):
-            shift, result = 0, 0
-            while True:
-                byte = ord(polyline_str[index]) - 63
-                index += 1
-                result |= (byte & 0x1F) << shift
-                shift += 5
-                if byte < 0x20:
-                    break
-            delta = ~(result >> 1) if (result & 1) else (result >> 1)
-            if unit == "lat":
-                lat += delta
-            else:
-                lng += delta
-        coordinates.append((lat / 1e5, lng / 1e5))
-    return coordinates
-
-
 # ============================= PERSISTENT STORAGE ============================
 
 @st.cache_resource
@@ -183,15 +161,6 @@ def get_db_connection():
             destination TEXT NOT NULL,
             minutes REAL NOT NULL,
             cached_at TEXT NOT NULL,
-            PRIMARY KEY (origin, destination)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS directions_cache (
-            origin TEXT NOT NULL,
-            destination TEXT NOT NULL,
-            cached_at TEXT NOT NULL,
-            data_json TEXT NOT NULL,
             PRIMARY KEY (origin, destination)
         )
     """)
@@ -260,27 +229,6 @@ def save_drive_time_to_cache(conn, origin: str, destination: str, minutes: float
     conn.commit()
 
 
-def get_cached_direction(conn, origin: str, destination: str, max_age_hours: float):
-    cur = conn.execute("SELECT data_json, cached_at FROM directions_cache WHERE origin = ? AND destination = ?", (origin, destination))
-    row = cur.fetchone()
-    if not row:
-        return None
-    data_json, cached_at = row
-    if dt.datetime.now() - dt.datetime.fromisoformat(cached_at) > dt.timedelta(hours=max_age_hours):
-        return None
-    return json.loads(data_json)
-
-
-def save_direction_to_cache(conn, origin: str, destination: str, data: dict):
-    now = dt.datetime.now().isoformat()
-    conn.execute(
-        """INSERT INTO directions_cache (origin, destination, cached_at, data_json) VALUES (?, ?, ?, ?)
-           ON CONFLICT(origin, destination) DO UPDATE SET cached_at = excluded.cached_at, data_json = excluded.data_json""",
-        (origin, destination, now, json.dumps(data)),
-    )
-    conn.commit()
-
-
 def get_settings(conn) -> dict:
     cur = conn.execute("SELECT value FROM settings WHERE key = 'app_settings'")
     row = cur.fetchone()
@@ -328,10 +276,8 @@ def get_calendar_service():
     if "GOOGLE_TOKEN" in st.secrets:
         token_data = dict(st.secrets["GOOGLE_TOKEN"])
         
-        # Ensure expiry is ALWAYS a string before handing it to Google Auth
         expiry_val = token_data.get("expiry")
         if isinstance(expiry_val, dt.datetime):
-            # If Streamlit auto-parsed it, turn it back into an ISO string
             expiry_val = expiry_val.isoformat().replace("+00:00", "")
             if not expiry_val.endswith("Z"):
                 expiry_val += "Z"
@@ -867,97 +813,34 @@ def recs_to_csv(recommendations: list[dict]) -> str:
     return buf.getvalue()
 
 
-# ============================= ROUTE MAP ================================
+# ============================= GOOGLE MAPS LINK GENERATOR =====================
 
-def get_directions(conn, gmaps_client, origin: str, destination: str, depart_at: dt.datetime):
-    cached = get_cached_direction(conn, origin, destination, DRIVE_TIME_CACHE_MAX_AGE_HOURS)
-    if cached:
-        return cached
-    if not gmaps_client:
-        return None
-    try:
-        result = gmaps_client.directions(origin, destination, mode="driving", departure_time=depart_at)
-        if not result:
-            return None
-        leg = result[0]["legs"][0]
-        data = {
-            "polyline": result[0]["overview_polyline"]["points"],
-            "start_lat": leg["start_location"]["lat"], "start_lng": leg["start_location"]["lng"],
-            "end_lat": leg["end_location"]["lat"], "end_lng": leg["end_location"]["lng"],
-            "distance_text": leg["distance"]["text"], "duration_text": leg["duration"]["text"],
-        }
-        save_direction_to_cache(conn, origin, destination, data)
-        return data
-    except Exception:
-        return None
-
-
-def build_deck(points: list[dict], legs: list[dict]) -> pdk.Deck:
-    path_layer = pdk.Layer("PathLayer", data=legs, get_path="path", get_width=5, get_color=[42, 157, 143], width_min_pixels=3)
-    scatter = pdk.Layer("ScatterplotLayer", data=points, get_position="[lon, lat]", get_fill_color="color", get_radius=130, pickable=True)
-    text = pdk.Layer("TextLayer", data=points, get_position="[lon, lat]", get_text="name", get_size=13,
-                      get_color=[20, 20, 20, 255], get_pixel_offset=[0, -16])
-    lats = [p["lat"] for p in points]
-    lons = [p["lon"] for p in points]
-    view_state = pdk.ViewState(latitude=sum(lats) / len(lats), longitude=sum(lons) / len(lons), zoom=10)
-    return pdk.Deck(layers=[path_layer, scatter, text], initial_view_state=view_state,
-                     tooltip={"html": "<b>{name}</b><br/>{time}"}, map_style=None)
-
-
-def rec_key(rec: dict) -> str:
-    return f"{rec['cal_name']}|{rec['patient_name']}|{rec['day']}|{rec['start']}"
-
-
-def render_route_map(rec: dict, conn):
-    if not MAPS_API_KEY or not googlemaps:
-        st.info("Map view needs a Google Maps API key set up — ask whoever configured this app to add one.")
-        return
-    if "patient_location" not in rec:
-        st.info("This saved search was made before map view was added — run the search again to see the map for it.")
-        return
-
-    gmaps_client = googlemaps.Client(key=MAPS_API_KEY)
+def get_google_maps_url(rec: dict) -> str:
     day_stops = rec.get("day_stops", [])
-    suggested = {"summary": f"{rec['patient_name']} (suggested)", "location": rec["patient_location"],
-                 "start": rec["start"], "is_suggested": True}
-    all_stops = [dict(s, is_suggested=False) for s in day_stops] + [suggested]
-    all_stops.sort(key=lambda s: s["start"])
-
-    ordered = (
-        [{"summary": "Office", "location": OFFICE_ADDRESS, "start": None, "is_suggested": False}]
-        + all_stops
-        + [{"summary": "Office", "location": OFFICE_ADDRESS, "start": None, "is_suggested": False}]
-    )
-
-    with st.spinner("Building route map…"):
-        depart_anchor = dt.datetime.fromisoformat(rec["start"])
-        points, legs = [], []
-        for i in range(len(ordered) - 1):
-            a, b = ordered[i], ordered[i + 1]
-            direction = get_directions(conn, gmaps_client, a["location"], b["location"], depart_anchor)
-            if not direction:
-                continue
-            if i == 0:
-                points.append({
-                    "name": clean_display(a["summary"], 40), "time": "",
-                    "lat": direction["start_lat"], "lon": direction["start_lng"],
-                    "color": [230, 57, 70, 220] if a.get("is_suggested") else [69, 123, 157, 200],
-                })
-            points.append({
-                "name": clean_display(b["summary"], 40),
-                "time": fmt_dict_time(b["start"]) if b.get("start") else "",
-                "lat": direction["end_lat"], "lon": direction["end_lng"],
-                "color": [230, 57, 70, 220] if b.get("is_suggested") else [69, 123, 157, 200],
-            })
-            path_coords = [[lng, lat] for lat, lng in decode_polyline(direction["polyline"])]
-            legs.append({"path": path_coords})
-
-        if not points:
-            st.warning("Couldn't build the route map — no valid directions were returned.")
-            return
-
-        st.pydeck_chart(build_deck(points, legs))
-        st.caption("🔴 Suggested patient stop  ·  🔵 Existing appointments  ·  Lines show actual driving routes")
+    suggested_loc = rec.get("patient_location", "")
+    
+    # Combine existing day stops and the suggested stop, sorted chronologically by start time
+    all_stops = [dict(s, is_suggested=False) for s in day_stops]
+    if suggested_loc:
+        all_stops.append({
+            "summary": f"{rec['patient_name']} (suggested)",
+            "location": suggested_loc,
+            "start": rec["start"],
+            "is_suggested": True
+        })
+    all_stops.sort(key=lambda s: s.get("start") or "")
+    
+    waypoints = [s["location"] for s in all_stops if s.get("location")]
+    
+    base_url = "https://www.google.com/maps/dir/?api=1"
+    params = {
+        "origin": OFFICE_ADDRESS,
+        "destination": OFFICE_ADDRESS,
+    }
+    if waypoints:
+        params["waypoints"] = "|".join(waypoints)
+        
+    return base_url + "&" + urllib.parse.urlencode(params)
 
 
 # ============================= RESULTS RENDERING ================================
@@ -1016,11 +899,9 @@ def render_results(data: dict, conn):
                        f"({best['drive_before']:.0f} min drive there, {best['drive_after']:.0f} min to the next stop)")
             for note in best["notes"]:
                 st.warning(note, icon="⚠️")
-            key = rec_key(best)
-            if st.button("🗺️ Show route map for this day", key=f"btn_{key}"):
-                st.session_state[f"show_map_{key}"] = not st.session_state.get(f"show_map_{key}", False)
-            if st.session_state.get(f"show_map_{key}"):
-                render_route_map(best, conn)
+            
+            map_url = get_google_maps_url(best)
+            st.link_button("🗺️ Open full route in Google Maps", map_url, use_container_width=True)
 
         by_patient: dict[str, dict[str, dict]] = {}
         for r in recommendations:
@@ -1051,11 +932,9 @@ def render_results(data: dict, conn):
                                 f"{fmt_dict_time(rec['end'])}  ·  +{rec['detour']:.0f} min extra driving")
                     for note in rec["notes"]:
                         st.caption(f"⚠️ {note}")
-                    key = rec_key(rec)
-                    if st.button("🗺️ Show route map for this day", key=f"btn_{key}"):
-                        st.session_state[f"show_map_{key}"] = not st.session_state.get(f"show_map_{key}", False)
-                    if st.session_state.get(f"show_map_{key}"):
-                        render_route_map(rec, conn)
+                    
+                    rec_map_url = get_google_maps_url(rec)
+                    st.link_button("🗺️ Open full route in Google Maps", rec_map_url, use_container_width=True)
 
         st.markdown("---")
         csv_data = recs_to_csv(sorted_recs)
@@ -1172,7 +1051,7 @@ with st.sidebar.expander("📖 How This Works", expanded=False):
     - Patients marked "do not schedule" are automatically left out.
     - Patients with no address on file are left out too, but you'll see who they are.
     - Drive times are always calculated from real addresses via Google Maps — those numbers are accurate.
-    - Click "🗺️ Show route map" on any suggestion to see it plotted against that day's other appointments.
+    - Click **"Open full route in Google Maps"** on any suggestion to instantly open that day's complete route in Google Maps.
     - Business rules (working hours, appointment lengths, do-not-schedule keywords) live under the **⚙️ Settings** tab.
     - Every search is saved under **Past Searches** below — revisit one anytime without using any new Google Maps lookups.
     """)
