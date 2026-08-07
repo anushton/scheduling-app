@@ -871,54 +871,43 @@ def render_results(data: dict, conn):
     if not recommendations:
         st.warning("No open time slots were found. Try a wider date range, or check the notes above for excluded patients.")
     else:
-        sorted_recs = sorted(recommendations, key=lambda r: r["start"])
-        best = sorted_recs[0]
+        # Sort for Earliest Available vs Least Extra Driving
+        sorted_by_time = sorted(recommendations, key=lambda r: r["start"])
+        sorted_by_detour = sorted(recommendations, key=lambda r: r["detour"])
+        
+        earliest_rec = sorted_by_time[0]
+        best_detour_rec = sorted_by_detour[0]
 
-        with st.container(border=True):
-            st.markdown("### ⭐ Best Option")
-            st.markdown(f"**Patient:** {clean_display(best['patient_name'], 80)}")
-            st.markdown(f"**Employee:** {best['cal_name']}")
-            st.markdown(f"**When:** {fmt_dict_day(best['day'])}, {fmt_dict_time(best['start'])} – {fmt_dict_time(best['end'])}")
-            st.caption(f"Adds about {best['detour']:.0f} extra minutes of driving to that day "
-                       f"({best['drive_before']:.0f} min drive there, {best['drive_after']:.0f} min to the next stop)")
-            for note in best["notes"]:
-                st.warning(note, icon="⚠️")
-            
-            map_url = get_google_maps_url(best)
-            st.link_button("🗺️ Open full route in Google Maps", map_url, use_container_width=True)
+        # Display Top Recommendations Side-by-Side
+        col_top1, col_top2 = st.columns(2)
 
-        by_patient: dict[str, dict[str, dict]] = {}
-        for r in recommendations:
-            slot = by_patient.setdefault(r["patient_name"], {})
-            if r["cal_name"] not in slot or r["detour"] < slot[r["cal_name"]]["detour"]:
-                slot[r["cal_name"]] = r
+        with col_top1:
+            with st.container(border=True):
+                st.markdown("### ⏰ Earliest Available")
+                st.markdown(f"**Patient:** {clean_display(earliest_rec['patient_name'], 80)}")
+                st.markdown(f"**Employee:** {earliest_rec['cal_name']}")
+                st.markdown(f"**When:** {fmt_dict_day(earliest_rec['day'])}, {fmt_dict_time(earliest_rec['start'])} – {fmt_dict_time(earliest_rec['end'])}")
+                st.caption(f"Adds about {earliest_rec['detour']:.0f} extra minutes of driving "
+                           f"({earliest_rec['drive_before']:.0f} min there, {earliest_rec['drive_after']:.0f} min to next)")
+                for note in earliest_rec["notes"]:
+                    st.warning(note, icon="⚠️")
+                
+                map_url_time = get_google_maps_url(earliest_rec)
+                st.link_button("🗺️ Open route in Maps", map_url_time, use_container_width=True)
 
-        multi_tech_patients = {n: c for n, c in by_patient.items() if len(c) > 1}
-        if multi_tech_patients:
-            st.markdown("### 👥 Which Employee Should Take This?")
-            for pname, cal_recs in multi_tech_patients.items():
-                ranked = sorted(cal_recs.items(), key=lambda kv: kv[1]["detour"])
-                best_tech, best_tech_rec = ranked[0]
-                with st.container(border=True):
-                    st.markdown(f"**{clean_display(pname, 80)}**")
-                    st.markdown(f"Better fit: **{best_tech}** — {fmt_dict_day(best_tech_rec['day'], '%a, %b %d')} at "
-                                f"{fmt_dict_time(best_tech_rec['start'])} (+{best_tech_rec['detour']:.0f} min extra driving)")
-                    for cal_name, rec in ranked[1:]:
-                        st.caption(f"{cal_name} could also do {fmt_dict_day(rec['day'], '%a, %b %d')} at "
-                                   f"{fmt_dict_time(rec['start'])} (+{rec['detour']:.0f} min extra driving)")
-
-        if len(sorted_recs) > 1:
-            st.markdown("### Other Times That Would Work")
-            for rec in sorted_recs[1:]:
-                with st.container(border=True):
-                    st.markdown(f"**{clean_display(rec['patient_name'], 80)}** — {rec['cal_name']}")
-                    st.markdown(f"{fmt_dict_day(rec['day'], '%a, %b %d')}, {fmt_dict_time(rec['start'])} – "
-                                f"{fmt_dict_time(rec['end'])}  ·  +{rec['detour']:.0f} min extra driving")
-                    for note in rec["notes"]:
-                        st.caption(f"⚠️ {note}")
-                    
-                    rec_map_url = get_google_maps_url(rec)
-                    st.link_button("🗺️ Open full route in Google Maps", rec_map_url, use_container_width=True)
+        with col_top2:
+            with st.container(border=True):
+                st.markdown("### 🚗 Least Extra Driving")
+                st.markdown(f"**Patient:** {clean_display(best_detour_rec['patient_name'], 80)}")
+                st.markdown(f"**Employee:** {best_detour_rec['cal_name']}")
+                st.markdown(f"**When:** {fmt_dict_day(best_detour_rec['day'])}, {fmt_dict_time(best_detour_rec['start'])} – {fmt_dict_time(best_detour_rec['end'])}")
+                st.caption(f"Adds about {best_detour_rec['detour']:.0f} extra minutes of driving "
+                           f"({best_detour_rec['drive_before']:.0f} min there, {best_detour_rec['drive_after']:.0f} min to next)")
+                for note in best_detour_rec["notes"]:
+                    st.warning(note, icon="⚠️")
+                
+                map_url_detour = get_google_maps_url(best_detour_rec)
+                st.link_button("🗺️ Open route in Maps", map_url_detour, use_container_width=True)
 
         st.markdown("---")
         csv_data = recs_to_csv(sorted_recs)
